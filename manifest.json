@@ -1,0 +1,671 @@
+/* Butt & Belly Tracker (PWA)
+   - Inventory with reorder links
+   - Diaper event log: Wet/Poop + "size used" follow-up + decrement inventory
+   - Feed log (oz or mL)
+   - Weight log (lb or kg)
+   - Age-based summaries + Chart.js graphs
+   - Informational ranges based on common pediatric guidance (not medical advice)
+*/
+
+const LS_INV = "buttbelly_inventory_v1";
+const LS_PROFILE = "buttbelly_profile_v1";
+const LS_LOGS = "buttbelly_logs_v1"; // { diapers:[], feeds:[], weights:[] }
+
+const els = {
+  installBtn: document.getElementById("installBtn"),
+
+  babyName: document.getElementById("babyName"),
+  babyDob: document.getElementById("babyDob"),
+  unitSelect: document.getElementById("unitSelect"),
+  saveProfileBtn: document.getElementById("saveProfileBtn"),
+  ageText: document.getElementById("ageText"),
+
+  logWetBtn: document.getElementById("logWetBtn"),
+  logPoopBtn: document.getElementById("logPoopBtn"),
+  diaperInvSelect: document.getElementById("diaperInvSelect"),
+  diaperSizeUsed: document.getElementById("diaperSizeUsed"),
+  diaperTime: document.getElementById("diaperTime"),
+
+  feedAmount: document.getElementById("feedAmount"),
+  feedTime: document.getElementById("feedTime"),
+  logFeedBtn: document.getElementById("logFeedBtn"),
+
+  weightValue: document.getElementById("weightValue"),
+  weightTime: document.getElementById("weightTime"),
+  logWeightBtn: document.getElementById("logWeightBtn"),
+
+  todaySummary: document.getElementById("todaySummary"),
+  recommendations: document.getElementById("recommendations"),
+
+  chartDiapers: document.getElementById("chartDiapers"),
+  chartFeeds: document.getElementById("chartFeeds"),
+  chartWeight: document.getElementById("chartWeight"),
+
+  // Inventory UI
+  typeSelect: document.getElementById("typeSelect"),
+  brandInput: document.getElementById("brandInput"),
+  sizeInput: document.getElementById("sizeInput"),
+  sizeField: document.getElementById("sizeField"),
+  qtyInput: document.getElementById("qtyInput"),
+  linkInput: document.getElementById("linkInput"),
+  thresholdInput: document.getElementById("thresholdInput"),
+  addBtn: document.getElementById("addBtn"),
+  resetFormBtn: document.getElementById("resetFormBtn"),
+
+  filterSelect: document.getElementById("filterSelect"),
+  searchInput: document.getElementById("searchInput"),
+  sortSelect: document.getElementById("sortSelect"),
+  exportBtn: document.getElementById("exportBtn"),
+  importBtn: document.getElementById("importBtn"),
+  clearAllBtn: document.getElementById("clearAllBtn"),
+  inventory: document.getElementById("inventory"),
+
+  importModal: document.getElementById("importModal"),
+  importCloseBtn: document.getElementById("importCloseBtn"),
+  importText: document.getElementById("importText"),
+  importDoBtn: document.getElementById("importDoBtn"),
+};
+
+// ---------- Utilities ----------
+function nowIso(){ return new Date().toISOString(); }
+function pad2(n){ return String(n).padStart(2,"0"); }
+
+function toDatetimeLocalValue(d){
+  const yyyy = d.getFullYear();
+  const mm = pad2(d.getMonth()+1);
+  const dd = pad2(d.getDate());
+  const hh = pad2(d.getHours());
+  const mi = pad2(d.getMinutes());
+  return `${yyyy}-${mm}-${dd}T${hh}:${mi}`;
+}
+
+function parseDatetimeLocal(value){
+  if (!value) return null;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
+}
+
+function escapeHtml(str){
+  return (str ?? "").toString().replace(/[&<>"']/g, (c)=>({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"
+  }[c]));
+}
+
+function normalizeBrand(s){
+  return (s ?? "").trim().replace(/\s+/g, " ");
+}
+
+function makeInvId(type, brand, size){
+  const b = normalizeBrand(brand).toLowerCase();
+  const z = (size ?? "").trim().toLowerCase();
+  return `${type}::${b}::${z}`;
+}
+
+function isoToDayKey(iso){
+  const d = new Date(iso);
+  const yyyy = d.getFullYear();
+  const mm = pad2(d.getMonth()+1);
+  const dd = pad2(d.getDate());
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function daysBetween(aIso, bIso){
+  const a = new Date(aIso); a.setHours(0,0,0,0);
+  const b = new Date(bIso); b.setHours(0,0,0,0);
+  return Math.round((b - a) / (1000*60*60*24));
+}
+
+// ---------- Storage ----------
+function loadProfile(){
+  try{
+    const raw = localStorage.getItem(LS_PROFILE);
+    const p = raw ? JSON.parse(raw) : null;
+    return p && typeof p === "object" ? p : { name:"", dob:"", units:"us" };
+  }catch{
+    return { name:"", dob:"", units:"us" };
+  }
+}
+function saveProfile(p){ localStorage.setItem(LS_PROFILE, JSON.stringify(p)); }
+
+function loadInventory(){
+  try{
+    const raw = localStorage.getItem(LS_INV);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  }catch{
+    return [];
+  }
+}
+function saveInventory(items){ localStorage.setItem(LS_INV, JSON.stringify(items)); }
+
+function loadLogs(){
+  try{
+    const raw = localStorage.getItem(LS_LOGS);
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (!parsed || typeof parsed !== "object") throw new Error("bad");
+    return {
+      diapers: Array.isArray(parsed.diapers) ? parsed.diapers : [],
+      feeds: Array.isArray(parsed.feeds) ? parsed.feeds : [],
+      weights: Array.isArray(parsed.weights) ? parsed.weights : [],
+    };
+  }catch{
+    return { diapers:[], feeds:[], weights:[] };
+  }
+}
+function saveLogs(logs){ localStorage.setItem(LS_LOGS, JSON.stringify(logs)); }
+
+// ---------- Inventory ops ----------
+function upsertItem(newItem){
+  const items = loadInventory();
+  const idx = items.findIndex(i => i.id === newItem.id);
+  if (idx >= 0) items[idx] = { ...items[idx], ...newItem, updatedAt: nowIso() };
+  else items.push(newItem);
+  saveInventory(items);
+}
+function deleteItem(id){
+  saveInventory(loadInventory().filter(i => i.id !== id));
+}
+function updateQty(id, delta){
+  const items = loadInventory();
+  const idx = items.findIndex(i => i.id === id);
+  if (idx < 0) return;
+  const current = Number(items[idx].qty || 0);
+  items[idx].qty = Math.max(0, current + delta);
+  items[idx].updatedAt = nowIso();
+  saveInventory(items);
+}
+
+// ---------- Logging ----------
+function logDiaper({ kind, invId, sizeUsed, atIso }){
+  const logs = loadLogs();
+  logs.diapers.push({
+    id: crypto.randomUUID(),
+    kind,                 // "wet" | "poop"
+    invId: invId || "",   // inventory id used (if any)
+    sizeUsed: sizeUsed || "",
+    at: atIso || nowIso()
+  });
+  saveLogs(logs);
+  if (invId) updateQty(invId, -1);
+}
+
+function logFeed({ amount, atIso }){
+  const logs = loadLogs();
+  logs.feeds.push({
+    id: crypto.randomUUID(),
+    amount: Number(amount || 0),
+    at: atIso || nowIso()
+  });
+  saveLogs(logs);
+}
+
+function logWeight({ value, atIso }){
+  const logs = loadLogs();
+  logs.weights.push({
+    id: crypto.randomUUID(),
+    value: Number(value || 0),
+    at: atIso || nowIso()
+  });
+  saveLogs(logs);
+}
+
+// ---------- Baby age ----------
+function computeAgeText(profile){
+  if (!profile.dob) return "Set DOB to track age";
+  const dobIso = new Date(profile.dob).toISOString();
+  const todayIso = nowIso();
+  const days = Math.max(0, daysBetween(dobIso, todayIso));
+  const weeks = Math.floor(days / 7);
+  const rem = days % 7;
+  return `${days} days old (${weeks}w ${rem}d)`;
+}
+
+function ageInDaysAt(profile, atIso){
+  if (!profile.dob) return null;
+  const dob = new Date(profile.dob).toISOString();
+  return Math.max(0, daysBetween(dob, atIso));
+}
+
+// ---------- Recommendations (informational only) ----------
+function latestWeight(profile){
+  const logs = loadLogs();
+  const sorted = logs.weights.slice().sort((a,b)=>new Date(a.at) - new Date(b.at));
+  const last = sorted.at(-1);
+  if (!last) return null;
+  return { value: Number(last.value||0), at: last.at, units: profile.units };
+}
+
+function formatFeedUnits(profile){ return profile.units === "metric" ? "mL" : "oz"; }
+function formatWeightUnits(profile){ return profile.units === "metric" ? "kg" : "lb"; }
+
+function kgToLb(kg){ return kg * 2.2046226218; }
+function ozToMl(oz){ return oz * 29.5735295625; }
+
+// Rule-of-thumb estimate (informational): ~2.5 oz per lb per day, cap ~32 oz/day
+function recommendedDailyIntake(profile){
+  const w = latestWeight(profile);
+  if (!w) return null;
+
+  let weightLb = w.value;
+  if (profile.units === "metric") weightLb = kgToLb(w.value);
+
+  const baseOz = 2.5 * weightLb;
+  const cappedOz = Math.min(baseOz, 32);
+  const low = cappedOz * 0.9;
+  const high = cappedOz * 1.1;
+
+  if (profile.units === "metric"){
+    return {
+      low: ozToMl(low),
+      high: ozToMl(high),
+      capNote: baseOz > 32 ? "Capped around ~32 oz/day equivalent (informational)." : ""
+    };
+  }
+  return {
+    low,
+    high,
+    capNote: baseOz > 32 ? "Capped around ~32 oz/day (informational)." : ""
+  };
+}
+
+// ---------- Summaries ----------
+function logsToday(){
+  const logs = loadLogs();
+  const todayKey = isoToDayKey(nowIso());
+
+  const diapers = logs.diapers.filter(x => isoToDayKey(x.at) === todayKey);
+  const feeds = logs.feeds.filter(x => isoToDayKey(x.at) === todayKey);
+
+  const wet = diapers.filter(d=>d.kind==="wet").length;
+  const poop = diapers.filter(d=>d.kind==="poop").length;
+  const feedTotal = feeds.reduce((sum,f)=>sum + Number(f.amount||0), 0);
+
+  return { wet, poop, diapersTotal: diapers.length, feedTotal };
+}
+
+function summarizeAndRecommend(){
+  const profile = loadProfile();
+  els.ageText.textContent = computeAgeText(profile);
+
+  const today = logsToday();
+  const unitsFeed = formatFeedUnits(profile);
+
+  els.todaySummary.textContent =
+    `${today.diapersTotal} diapers today (${today.wet} wet, ${today.poop} poop) · Intake today: ${today.feedTotal.toFixed(1)} ${unitsFeed}`;
+
+  const parts = [];
+
+  if (profile.dob){
+    const ageDays = ageInDaysAt(profile, nowIso());
+    if (ageDays !== null){
+      if (ageDays >= 5){
+        parts.push(`Diapers (informational): by ~day 5, many babies have ~6+ wet diapers/day. If you’re consistently well below that, consider checking in with your pediatrician.`);
+      } else if (ageDays >= 1){
+        parts.push(`Diapers (informational): wet diaper counts often increase over the first several days after birth.`);
+      }
+    }
+  }
+
+  const rec = recommendedDailyIntake(profile);
+  if (rec){
+    parts.push(`Formula/milk (informational): estimated daily total about ${rec.low.toFixed(0)}–${rec.high.toFixed(0)} ${unitsFeed} per day (based on your latest logged weight). ${rec.capNote}`);
+  } else {
+    parts.push(`Tip: log a recent weight to get an informational intake range estimate.`);
+  }
+
+  parts.push(`Always follow baby’s cues and your clinician’s plan.`);
+
+  els.recommendations.innerHTML = `<ul>${parts.map(p=>`<li>${escapeHtml(p)}</li>`).join("")}</ul>`;
+}
+
+// ---------- Inventory UI ----------
+function handleTypeChange(){
+  const type = els.typeSelect.value;
+  els.sizeField.style.display = (type === "diaper") ? "" : "none";
+}
+function resetInvForm(){
+  els.typeSelect.value = "diaper";
+  els.brandInput.value = "";
+  els.sizeInput.value = "";
+  els.qtyInput.value = "";
+  els.linkInput.value = "";
+  els.thresholdInput.value = "";
+  handleTypeChange();
+}
+
+function filteredSortedInventory(){
+  const filter = els.filterSelect.value;
+  const q = (els.searchInput.value || "").trim().toLowerCase();
+  const sort = els.sortSelect.value;
+
+  let items = loadInventory();
+
+  if (filter === "diaper" || filter === "formula"){
+    items = items.filter(i => i.type === filter);
+  } else if (filter === "low"){
+    items = items.filter(i => Number(i.qty||0) <= Number(i.threshold||0));
+  }
+
+  if (q){
+    items = items.filter(i => (i.brand || "").toLowerCase().includes(q));
+  }
+
+  if (sort === "brand"){
+    items.sort((a,b)=>(a.brand||"").localeCompare(b.brand||""));
+  } else if (sort === "qty"){
+    items.sort((a,b)=>Number(a.qty||0) - Number(b.qty||0));
+  } else {
+    items.sort((a,b)=> (a.type||"").localeCompare(b.type||"") || (a.brand||"").localeCompare(b.brand||""));
+  }
+
+  return items;
+}
+
+function invItemCard(item){
+  const qty = Number(item.qty || 0);
+  const threshold = Number(item.threshold || 0);
+  const low = qty <= threshold;
+
+  const typeLabel = item.type === "diaper" ? "Diapers" : "Formula";
+  const sizeLabel = item.type === "diaper" && item.size ? ` · Size ${escapeHtml(item.size)}` : "";
+  const updated = item.updatedAt ? new Date(item.updatedAt).toLocaleString() : "—";
+
+  const reorderLink = (item.link || "").trim();
+  const linkHtml = reorderLink
+    ? `<a href="${reorderLink}" target="_blank" rel="noopener noreferrer">Reorder</a>`
+    : `<span class="muted">No reorder link</span>`;
+
+  return `
+    <div class="item">
+      <h3>${escapeHtml(item.brand || "(No brand)")}</h3>
+      <div class="meta">
+        <span class="badge ${low ? "low" : ""}">${typeLabel}${sizeLabel}</span>
+        <span class="badge ${low ? "low" : ""}">${low ? "LOW" : "OK"}</span>
+      </div>
+
+      <div class="meta">Qty left: <strong>${qty}</strong> · Low alert at: ${threshold} · Updated: ${escapeHtml(updated)}</div>
+
+      <div class="btnrow">
+        <button class="ghost" data-dec="${escapeHtml(item.id)}">-1</button>
+        <button class="ghost" data-inc="${escapeHtml(item.id)}">+10</button>
+        ${linkHtml}
+        <button class="danger" data-del="${escapeHtml(item.id)}">Delete</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderInventory(){
+  const items = filteredSortedInventory();
+  els.inventory.innerHTML = items.length
+    ? items.map(invItemCard).join("")
+    : `<div class="muted">No items yet. Add one above.</div>`;
+
+  els.inventory.querySelectorAll("[data-dec]").forEach(btn=>{
+    btn.addEventListener("click", ()=>{
+      updateQty(btn.getAttribute("data-dec"), -1);
+      syncDiaperInvDropdown();
+      renderAll();
+    });
+  });
+  els.inventory.querySelectorAll("[data-inc]").forEach(btn=>{
+    btn.addEventListener("click", ()=>{
+      updateQty(btn.getAttribute("data-inc"), +10);
+      syncDiaperInvDropdown();
+      renderAll();
+    });
+  });
+  els.inventory.querySelectorAll("[data-del]").forEach(btn=>{
+    btn.addEventListener("click", ()=>{
+      const id = btn.getAttribute("data-del");
+      if (confirm("Delete this item?")) {
+        deleteItem(id);
+        syncDiaperInvDropdown();
+        renderAll();
+      }
+    });
+  });
+}
+
+// ---------- Diaper inventory dropdown ----------
+function syncDiaperInvDropdown(){
+  const diapers = loadInventory().filter(i=>i.type==="diaper");
+  const current = els.diaperInvSelect.value;
+
+  els.diaperInvSelect.innerHTML =
+    `<option value="">(don’t decrement inventory)</option>` +
+    diapers.map(d=>{
+      const label = `${d.brand}${d.size ? ` (Size ${d.size})` : ""} — ${Number(d.qty||0)} left`;
+      return `<option value="${escapeHtml(d.id)}">${escapeHtml(label)}</option>`;
+    }).join("");
+
+  const exists = diapers.some(d=>d.id===current);
+  els.diaperInvSelect.value = exists ? current : "";
+}
+
+// ---------- Charts ----------
+let chartDiapers = null;
+let chartFeeds = null;
+let chartWeight = null;
+
+function buildDailyBuckets(lastNDays=14){
+  const logs = loadLogs();
+  const today = new Date(); today.setHours(0,0,0,0);
+
+  const days = [];
+  for (let i = lastNDays-1; i >= 0; i--){
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    days.push(isoToDayKey(d.toISOString()));
+  }
+
+  const diaperByDay = new Map(days.map(k=>[k,{wet:0, poop:0}]));
+  for (const d of logs.diapers){
+    const k = isoToDayKey(d.at);
+    if (!diaperByDay.has(k)) continue;
+    if (d.kind === "wet") diaperByDay.get(k).wet += 1;
+    if (d.kind === "poop") diaperByDay.get(k).poop += 1;
+  }
+
+  const feedByDay = new Map(days.map(k=>[k,0]));
+  for (const f of logs.feeds){
+    const k = isoToDayKey(f.at);
+    if (!feedByDay.has(k)) continue;
+    feedByDay.set(k, feedByDay.get(k) + Number(f.amount||0));
+  }
+
+  const weights = logs.weights
+    .slice()
+    .sort((a,b)=>new Date(a.at)-new Date(b.at))
+    .map(w=>({ x: isoToDayKey(w.at), y: Number(w.value||0) }));
+
+  return { days, diaperByDay, feedByDay, weights };
+}
+
+function renderCharts(){
+  const profile = loadProfile();
+  const { days, diaperByDay, feedByDay, weights } = buildDailyBuckets(14);
+  const feedUnits = formatFeedUnits(profile);
+  const weightUnits = formatWeightUnits(profile);
+
+  const wetData = days.map(k=>diaperByDay.get(k).wet);
+  const poopData = days.map(k=>diaperByDay.get(k).poop);
+  const feedData = days.map(k=>Number(feedByDay.get(k) || 0));
+
+  if (chartDiapers) chartDiapers.destroy();
+  if (chartFeeds) chartFeeds.destroy();
+  if (chartWeight) chartWeight.destroy();
+
+  chartDiapers = new Chart(els.chartDiapers, {
+    type: "bar",
+    data: { labels: days, datasets: [{ label: "Wet", data: wetData, stack: "s" }, { label: "Poop", data: poopData, stack: "s" }] },
+    options: { responsive: true, plugins: { legend: { display: true } }, scales: { x: { stacked: true }, y: { stacked: true, beginAtZero: true } } }
+  });
+
+  chartFeeds = new Chart(els.chartFeeds, {
+    type: "line",
+    data: { labels: days, datasets: [{ label: `Intake (${feedUnits})`, data: feedData }] },
+    options: { responsive: true, plugins: { legend: { display: true } }, scales: { y: { beginAtZero: true } } }
+  });
+
+  chartWeight = new Chart(els.chartWeight, {
+    type: "line",
+    data: { labels: weights.map(p=>p.x), datasets: [{ label: `Weight (${weightUnits})`, data: weights.map(p=>p.y) }] },
+    options: { responsive: true, plugins: { legend: { display: true } }, scales: { y: { beginAtZero: false } } }
+  });
+}
+
+// ---------- Render all ----------
+function renderAll(){
+  summarizeAndRecommend();
+  renderInventory();
+  renderCharts();
+  syncDiaperInvDropdown();
+}
+
+// ---------- Event handlers ----------
+els.saveProfileBtn.addEventListener("click", ()=>{
+  const p = loadProfile();
+  p.name = (els.babyName.value || "").trim();
+  p.dob = els.babyDob.value || "";
+  p.units = els.unitSelect.value === "metric" ? "metric" : "us";
+  saveProfile(p);
+  renderAll();
+});
+
+els.logWetBtn.addEventListener("click", ()=>{
+  const at = parseDatetimeLocal(els.diaperTime.value) || nowIso();
+  logDiaper({ kind: "wet", invId: els.diaperInvSelect.value || "", sizeUsed: els.diaperSizeUsed.value || "", atIso: at });
+  renderAll();
+});
+
+els.logPoopBtn.addEventListener("click", ()=>{
+  const at = parseDatetimeLocal(els.diaperTime.value) || nowIso();
+  logDiaper({ kind: "poop", invId: els.diaperInvSelect.value || "", sizeUsed: els.diaperSizeUsed.value || "", atIso: at });
+  renderAll();
+});
+
+els.logFeedBtn.addEventListener("click", ()=>{
+  const amt = Number(els.feedAmount.value);
+  if (!Number.isFinite(amt) || amt <= 0){ alert("Enter a feed amount > 0."); return; }
+  const at = parseDatetimeLocal(els.feedTime.value) || nowIso();
+  logFeed({ amount: amt, atIso: at });
+  els.feedAmount.value = "";
+  renderAll();
+});
+
+els.logWeightBtn.addEventListener("click", ()=>{
+  const val = Number(els.weightValue.value);
+  if (!Number.isFinite(val) || val <= 0){ alert("Enter a weight > 0."); return; }
+  const at = parseDatetimeLocal(els.weightTime.value) || nowIso();
+  logWeight({ value: val, atIso: at });
+  els.weightValue.value = "";
+  renderAll();
+});
+
+// Inventory add/update
+els.addBtn.addEventListener("click", ()=>{
+  const type = els.typeSelect.value;
+  const brand = normalizeBrand(els.brandInput.value);
+  const size = (els.sizeInput.value || "").trim();
+  const qty = Number(els.qtyInput.value);
+  const threshold = Number(els.thresholdInput.value);
+  const link = (els.linkInput.value || "").trim();
+
+  if (!brand){ alert("Please enter a brand name."); return; }
+  if (!Number.isFinite(qty) || qty < 0){ alert("Enter a valid non-negative quantity."); return; }
+  if (!Number.isFinite(threshold) || threshold < 0){ alert("Enter a valid non-negative low-stock threshold."); return; }
+
+  const id = makeInvId(type, brand, type === "diaper" ? size : "");
+  upsertItem({ id, type, brand, size: type === "diaper" ? size : "", qty, threshold, link, createdAt: nowIso(), updatedAt: nowIso() });
+
+  resetInvForm();
+  syncDiaperInvDropdown();
+  renderAll();
+});
+
+els.resetFormBtn.addEventListener("click", resetInvForm);
+els.typeSelect.addEventListener("change", handleTypeChange);
+els.filterSelect.addEventListener("change", renderAll);
+els.sortSelect.addEventListener("change", renderAll);
+els.searchInput.addEventListener("input", renderAll);
+
+els.clearAllBtn.addEventListener("click", ()=>{
+  if (!confirm("Clear ALL inventory + logs + profile?")) return;
+  localStorage.removeItem(LS_INV);
+  localStorage.removeItem(LS_LOGS);
+  localStorage.removeItem(LS_PROFILE);
+  init();
+});
+
+// Export/import includes everything (profile + inventory + logs)
+els.exportBtn.addEventListener("click", async ()=>{
+  const bundle = { profile: loadProfile(), inventory: loadInventory(), logs: loadLogs(), exportedAt: nowIso() };
+  const data = JSON.stringify(bundle, null, 2);
+  try{ await navigator.clipboard.writeText(data); alert("Copied export JSON to clipboard."); }
+  catch{ prompt("Copy this JSON:", data); }
+});
+
+els.importBtn.addEventListener("click", ()=>{
+  els.importText.value = "";
+  els.importModal.showModal();
+});
+els.importCloseBtn.addEventListener("click", ()=>els.importModal.close());
+
+els.importDoBtn.addEventListener("click", ()=>{
+  try{
+    const parsed = JSON.parse(els.importText.value || "{}");
+    if (!parsed || typeof parsed !== "object") throw new Error("bad");
+    if (parsed.profile) saveProfile(parsed.profile);
+    if (Array.isArray(parsed.inventory)) saveInventory(parsed.inventory);
+    if (parsed.logs) saveLogs(parsed.logs);
+    els.importModal.close();
+    init(false);
+  }catch{
+    alert("Import failed. Make sure you pasted a valid export JSON.");
+  }
+});
+
+// ---------- PWA install + SW ----------
+let deferredPrompt = null;
+window.addEventListener("beforeinstallprompt", (e)=>{
+  e.preventDefault();
+  deferredPrompt = e;
+  els.installBtn.hidden = false;
+});
+els.installBtn.addEventListener("click", async ()=>{
+  if (!deferredPrompt) return;
+  deferredPrompt.prompt();
+  await deferredPrompt.userChoice;
+  deferredPrompt = null;
+  els.installBtn.hidden = true;
+});
+if ("serviceWorker" in navigator){
+  window.addEventListener("load", ()=>{
+    navigator.serviceWorker.register("./sw.js").catch(()=>{});
+  });
+}
+
+// ---------- Init ----------
+function init(setDefaultTimes=true){
+  const profile = loadProfile();
+  els.babyName.value = profile.name || "";
+  els.babyDob.value = profile.dob || "";
+  els.unitSelect.value = profile.units === "metric" ? "metric" : "us";
+
+  handleTypeChange();
+  resetInvForm();
+  syncDiaperInvDropdown();
+
+  if (setDefaultTimes){
+    const now = new Date();
+    els.diaperTime.value = toDatetimeLocalValue(now);
+    els.feedTime.value = toDatetimeLocalValue(now);
+    els.weightTime.value = toDatetimeLocalValue(now);
+  }
+
+  renderAll();
+}
+
+init();
